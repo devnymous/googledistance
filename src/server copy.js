@@ -80,8 +80,7 @@ function extract(text, source, destination) {
     const distance = route?.[2]?.[1] || null;
     const duration = route?.[3]?.[1] || null;
 
-    const rawPoints = extractPoints(data, source, destination);
-    const points = cleanPoints(rawPoints); // ✅ FIX APPLIED HERE
+    const points = extractPoints(data, source, destination);
 
     return {
       source,
@@ -90,10 +89,10 @@ function extract(text, source, destination) {
       duration,
       polyline: {
         points,
-        pointCount: points.length,
+         pointCount: points.length,
         encoded: encodePolyline(points)
       },
-      note: "Playwright cleaned polyline"
+      note: "Playwright with polyline"
     };
   } catch {
     return {
@@ -140,27 +139,6 @@ function addPoint(points, value) {
   if (Number.isFinite(lat) && Number.isFinite(lng)) {
     points.push({ lat, lng });
   }
-}
-
-/* ================= CLEAN POINTS ================= */
-
-function cleanPoints(points) {
-  const cleaned = [];
-  let prev = null;
-
-  for (const p of points) {
-    if (!p || !isFinite(p.lat) || !isFinite(p.lng)) continue;
-
-    const lat = Number(p.lat.toFixed(6));
-    const lng = Number(p.lng.toFixed(6));
-
-    if (!prev || prev.lat !== lat || prev.lng !== lng) {
-      cleaned.push({ lat, lng });
-      prev = { lat, lng };
-    }
-  }
-
-  return cleaned;
 }
 
 /* ================= ENCODER ================= */
