@@ -1,181 +1,202 @@
 const express = require("express");
-const { chromium } = require("playwright");
+const puppeteer = require("puppeteer");
 
 const app = express();
 const port = 3000;
 
+let browserPromise = null;
+
 app.use(express.json());
-
-let browser;
-let context;
-
-/* ================= INIT ================= */
-
-(async () => {
-  browser = await chromium.launch({ headless: true });
-  context = await browser.newContext();
-})();
-
-/* ================= ROUTE ================= */
 
 app.post("/google", async (req, res) => {
   try {
-    const source = req.body.source;
-    const destination = req.body.destination;
+    const source = parseRequestCoordinate(req.body.source, "source");
+    const destination = parseRequestCoordinate(req.body.destination, "destination");
 
-    const url = `https://www.google.com/maps/dir/${source.lat},${source.lng}/${destination.lat},${destination.lng}`;
+    const url = buildGoogleMapsUrl(source, destination);
 
-    const page = await context.newPage();
+    const data = await getGoogleMapsData(url, source, destination);
 
-    const result = await getDirectionsFast(page, url, source, destination);
-
-    await page.close();
-
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-/* ================= FAST FETCH ================= */
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
 
-async function getDirectionsFast(page, url, source, destination) {
+/* ================= CORE ================= */
+
+async function getGoogleMapsData(url, source, destination) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+
+  // 🚀 Block heavy resources
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const type = req.resourceType();
+    if (["image", "stylesheet", "font", "media"].includes(type)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
+  let resolved = false;
+
   return new Promise(async (resolve, reject) => {
-    let timeout;
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        resolve(emptyResponse(source, destination));
+      }
+    }, 5000);
 
     page.on("response", async (response) => {
+      if (resolved) return;
+
       if (response.url().includes("/maps/preview/directions")) {
         try {
           const text = await response.text();
+
+          const routes = extractRoutes(text, source, destination);
+          const first = routes[0] || {};
+
           clearTimeout(timeout);
-          resolve(extract(text, source, destination));
-        } catch (err) {
-          reject(err);
+          resolved = true;
+
+          resolve({
+            url,
+            source,
+            destination,
+            distance: first.distance || null,
+            duration: first.duration || null,
+            polyline: first.polyline || null,
+            routes
+          });
+        } catch (e) {
+          reject(e);
         }
       }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-
-    timeout = setTimeout(() => {
-      resolve({
-        source,
-        destination,
-        distance: null,
-        duration: null,
-        polyline: null,
-        note: "Timeout fallback"
-      });
-    }, 3000);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+  }).finally(async () => {
+    await page.close();
   });
 }
 
-/* ================= PARSER ================= */
+/* ================= BROWSER ================= */
 
-function extract(text, source, destination) {
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    });
+  }
+
+  return browserPromise;
+}
+
+/* ================= ROUTE PARSER ================= */
+
+function extractRoutes(text, origin, destination) {
   try {
     const data = JSON.parse(text.replace(/^\)\]\}'\n/, ""));
-    const route = data?.[0]?.[1]?.[0]?.[0];
+    const routes = data?.[0]?.[1] || [];
 
-    const distance = route?.[2]?.[1] || null;
-    const duration = route?.[3]?.[1] || null;
-
-    const rawPoints = extractPoints(data, source, destination);
-    const points = cleanPoints(rawPoints); // ✅ FIX APPLIED HERE
-
-    return {
-      source,
-      destination,
-      distance,
-      duration,
-      polyline: {
-        points,
-        pointCount: points.length,
-        encoded: encodePolyline(points)
-      },
-      note: "Playwright cleaned polyline"
-    };
+    return routes.map((route, i) => buildRoute(route, i, origin, destination));
   } catch {
-    return {
-      source,
-      destination,
-      distance: null,
-      duration: null,
-      polyline: null,
-      note: "Parse failed"
-    };
+    return [];
   }
 }
 
-/* ================= POLYLINE EXTRACTION ================= */
+function buildRoute(route, index, origin, destination) {
+  const summary = route?.[0];
+  const points = extractPoints(route, origin, destination);
 
-function extractPoints(data, source, destination) {
+  return {
+    index,
+    name: summary?.[1] || null,
+    distance: summary?.[2]?.[1] || null,
+    duration: summary?.[3]?.[1] || null,
+    polyline: buildPolyline(points)
+  };
+}
+
+/* ================= POLYLINE ================= */
+
+function extractPoints(route, origin, destination) {
   const points = [];
+  const steps = route?.[1]?.[0]?.[1]?.[0]?.[1] || [];
 
-  try {
-    const steps = data?.[0]?.[1]?.[0]?.[1]?.[0]?.[1]?.[0]?.[1] || [];
+  addPoint(points, origin);
 
-    points.push(source);
+  for (const step of steps) {
+    const geo = step?.[0]?.[7];
+    addPoint(points, parseCoord(geo?.[1]?.[0]));
+    addPoint(points, parseCoord(geo?.[1]?.[1]));
+    addPoint(points, parseCoord(geo?.[2]));
+  }
 
-    for (const step of steps) {
-      const geo = step?.[0]?.[7];
+  addPoint(points, destination);
 
-      addPoint(points, geo?.[1]?.[0]);
-      addPoint(points, geo?.[1]?.[1]);
-      addPoint(points, geo?.[2]);
-    }
-
-    points.push(destination);
-  } catch {}
-
-  return points;
+  return cleanPoints(points);
 }
 
-function addPoint(points, value) {
-  if (!value) return;
+function parseCoord(v) {
+  const lat = v?.[2];
+  const lng = v?.[3];
+  return isValid(lat, lng) ? { lat, lng } : null;
+}
 
-  const lat = value?.[2];
-  const lng = value?.[3];
-
-  if (Number.isFinite(lat) && Number.isFinite(lng)) {
-    points.push({ lat, lng });
+function addPoint(arr, p) {
+  if (!p) return;
+  const last = arr[arr.length - 1];
+  if (!last || last.lat !== p.lat || last.lng !== p.lng) {
+    arr.push({
+      lat: Number(p.lat.toFixed(6)),
+      lng: Number(p.lng.toFixed(6))
+    });
   }
 }
-
-/* ================= CLEAN POINTS ================= */
 
 function cleanPoints(points) {
-  const cleaned = [];
-  let prev = null;
-
-  for (const p of points) {
-    if (!p || !isFinite(p.lat) || !isFinite(p.lng)) continue;
-
-    const lat = Number(p.lat.toFixed(6));
-    const lng = Number(p.lng.toFixed(6));
-
-    if (!prev || prev.lat !== lat || prev.lng !== lng) {
-      cleaned.push({ lat, lng });
-      prev = { lat, lng };
-    }
-  }
-
-  return cleaned;
+  return points.filter((p, i, arr) => {
+    if (i === 0) return true;
+    const prev = arr[i - 1];
+    return p.lat !== prev.lat || p.lng !== prev.lng;
+  });
 }
 
-/* ================= ENCODER ================= */
+function buildPolyline(points) {
+  return {
+    pointCount: points.length,
+    points,
+    encoded: encodePolyline(points)
+  };
+}
+
+/* ================= ENCODE ================= */
 
 function encodePolyline(points) {
   let prevLat = 0;
   let prevLng = 0;
   let result = "";
 
-  for (const point of points) {
-    const lat = Math.round(point.lat * 1e5);
-    const lng = Math.round(point.lng * 1e5);
+  for (const p of points) {
+    const lat = Math.round(p.lat * 1e5);
+    const lng = Math.round(p.lng * 1e5);
 
-    result += encodeValue(lat - prevLat);
-    result += encodeValue(lng - prevLng);
+    result += encode(lat - prevLat);
+    result += encode(lng - prevLng);
 
     prevLat = lat;
     prevLng = lng;
@@ -184,22 +205,47 @@ function encodePolyline(points) {
   return result;
 }
 
-function encodeValue(value) {
-  value = value < 0 ? ~(value << 1) : value << 1;
-  let encoded = "";
+function encode(num) {
+  num = num < 0 ? ~(num << 1) : num << 1;
+  let str = "";
 
-  while (value >= 0x20) {
-    encoded += String.fromCharCode((0x20 | (value & 0x1f)) + 63);
-    value >>= 5;
+  while (num >= 0x20) {
+    str += String.fromCharCode((0x20 | (num & 0x1f)) + 63);
+    num >>= 5;
   }
 
-  encoded += String.fromCharCode(value + 63);
-
-  return encoded;
+  str += String.fromCharCode(num + 63);
+  return str;
 }
 
-/* ================= SERVER ================= */
+/* ================= HELPERS ================= */
 
-app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
-});
+function parseRequestCoordinate(v, name) {
+  const lat = Number(v?.lat);
+  const lng = Number(v?.lng);
+
+  if (!isValid(lat, lng)) {
+    throw new Error(`${name} invalid`);
+  }
+
+  return { lat, lng };
+}
+
+function isValid(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng);
+}
+
+function buildGoogleMapsUrl(s, d) {
+  return `https://www.google.com/maps/dir/?api=1&origin=${s.lat},${s.lng}&destination=${d.lat},${d.lng}`;
+}
+
+function emptyResponse(source, destination) {
+  return {
+    source,
+    destination,
+    distance: null,
+    duration: null,
+    polyline: null,
+    routes: []
+  };
+}
