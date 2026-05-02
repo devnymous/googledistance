@@ -1,0 +1,11 @@
+.DS_Store
+.git
+.gitignore
+.env
+.env.*
+Dockerfile
+docker-compose.yml
+google-response.txt
+node_modules
+npm-debug.log*
+coverage

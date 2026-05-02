@@ -2,11 +2,30 @@ const express = require("express");
 const puppeteer = require("puppeteer");
 
 const app = express();
-const port = 3000;
+const port = Number(process.env.PORT) || 3000;
 
 let browserPromise = null;
 
 app.use(express.json());
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+
+  logInfo("request:start", {
+    method: req.method,
+    path: req.originalUrl
+  });
+
+  res.on("finish", () => {
+    logInfo("request:finish", {
+      method: req.method,
+      path: req.originalUrl,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAt
+    });
+  });
+
+  next();
+});
 
 /* ================= ROUTES ================= */
 
@@ -15,9 +34,19 @@ app.post("/distance", async (req, res) => {
   try {
     const { source, destination } = parseInput(req);
 
+    logInfo("distance:fetch", { source, destination });
+
     const data = await fetchRoute(source, destination);
 
     const first = data.routes[0] || {};
+
+    logInfo("distance:success", {
+      source,
+      destination,
+      routeCount: data.routes.length,
+      distance: first.distance || null,
+      duration: first.duration || null
+    });
 
     res.json({
       source,
@@ -26,6 +55,7 @@ app.post("/distance", async (req, res) => {
       duration: first.duration || null
     });
   } catch (e) {
+    logError("distance:error", e, { body: req.body });
     res.status(500).json({ error: e.message });
   }
 });
@@ -35,9 +65,18 @@ app.post("/polyline", async (req, res) => {
   try {
     const { source, destination } = parseInput(req);
 
+    logInfo("polyline:fetch", { source, destination });
+
     const data = await fetchRoute(source, destination);
 
     const first = data.routes[0] || {};
+
+    logInfo("polyline:success", {
+      source,
+      destination,
+      routeCount: data.routes.length,
+      pointCount: first.polyline?.pointCount || 0
+    });
 
     res.json({
       source,
@@ -45,6 +84,7 @@ app.post("/polyline", async (req, res) => {
       polyline: first.polyline || null
     });
   } catch (e) {
+    logError("polyline:error", e, { body: req.body });
     res.status(500).json({ error: e.message });
   }
 });
@@ -52,13 +92,15 @@ app.post("/polyline", async (req, res) => {
 /* ================= SERVER ================= */
 
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  logInfo("server:started", { port });
 });
 
 /* ================= CORE ================= */
 
 async function fetchRoute(source, destination) {
   const url = buildGoogleMapsUrl(source, destination);
+
+  logInfo("route:start", { source, destination });
 
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -79,6 +121,7 @@ async function fetchRoute(source, destination) {
     const timeout = setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        logInfo("route:timeout", { source, destination });
         resolve(emptyResponse(source, destination));
       }
     }, 5000);
@@ -94,16 +137,32 @@ async function fetchRoute(source, destination) {
           clearTimeout(timeout);
           resolved = true;
 
+          logInfo("route:resolved", {
+            source,
+            destination,
+            routeCount: routes.length
+          });
+
           resolve({
             routes
           });
-        } catch {
+        } catch (e) {
+          logError("route:parse-error", e, { source, destination });
           resolve(emptyResponse(source, destination));
         }
       }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 10000 });
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 10000 });
+    } catch (e) {
+      if (!resolved) {
+        clearTimeout(timeout);
+        resolved = true;
+        logError("route:page-load-error", e, { source, destination });
+        resolve(emptyResponse(source, destination));
+      }
+    }
   }).finally(async () => {
     await page.close();
   });
@@ -113,6 +172,7 @@ async function fetchRoute(source, destination) {
 
 async function getBrowser() {
   if (!browserPromise) {
+    logInfo("browser:launch");
     browserPromise = puppeteer.launch({
       headless: true,
       args: [
@@ -121,6 +181,9 @@ async function getBrowser() {
         "--disable-dev-shm-usage"
       ]
     });
+    browserPromise
+      .then(() => logInfo("browser:ready"))
+      .catch((e) => logError("browser:error", e));
   }
   return browserPromise;
 }
@@ -258,6 +321,30 @@ function parseRequestCoordinate(v) {
 
 function isValid(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng);
+}
+
+function logInfo(message, details = {}) {
+  console.log(formatLog("info", message, details));
+}
+
+function logError(message, error, details = {}) {
+  const errorDetails = error instanceof Error
+    ? { error: error.message }
+    : { error: String(error) };
+
+  console.error(formatLog("error", message, {
+    ...details,
+    ...errorDetails
+  }));
+}
+
+function formatLog(level, message, details = {}) {
+  return JSON.stringify({
+    time: new Date().toISOString(),
+    level,
+    message,
+    ...details
+  });
 }
 
 function buildGoogleMapsUrl(s, d) {
