@@ -3,23 +3,27 @@ const puppeteer = require("puppeteer-core");
 
 const app = express();
 const port = 3000;
-const googleMapsUrl =
-  "https://www.google.com/maps/dir/?api=1&origin=9.8192117,99.9964583&destination=9.712199862086026,99.98672318780132&travelmode=driving";
 const chromePath =
   process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 let browserPromise = null;
+
+app.use(express.json());
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-app.get("/google", async (req, res) => {
+app.post("/google", async (req, res) => {
   try {
-    const data = await getGoogleMapsData();
+    const source = parseRequestCoordinate(req.body.source, "source");
+    const destination = parseRequestCoordinate(req.body.destination, "destination");
+    const travelmode = req.body.travelmode || "driving";
+    const googleMapsUrl = buildGoogleMapsUrl(source, destination, travelmode);
+    const data = await getGoogleMapsData(googleMapsUrl, source, destination);
 
     res.json(data);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -30,7 +34,36 @@ app.listen(port, () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-async function getGoogleMapsData() {
+function parseRequestCoordinate(value, fieldName) {
+  const lat = Number(value?.lat ?? value?.latitude);
+  const lng = Number(value?.lng ?? value?.lon ?? value?.longitude);
+
+  if (!isValidCoordinate(lat, lng)) {
+    const error = new Error(
+      `${fieldName} must be an object like {"lat":9.8192117,"lng":99.9964583}`
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    lat,
+    lng
+  };
+}
+
+function buildGoogleMapsUrl(source, destination, travelmode) {
+  const url = new URL("https://www.google.com/maps/dir/");
+
+  url.searchParams.set("api", "1");
+  url.searchParams.set("origin", `${source.lat},${source.lng}`);
+  url.searchParams.set("destination", `${destination.lat},${destination.lng}`);
+  url.searchParams.set("travelmode", travelmode);
+
+  return url.toString();
+}
+
+async function getGoogleMapsData(googleMapsUrl, source, destination) {
   const browser = await getBrowser();
   const page = await browser.newPage();
   let directionsResponseText = null;
@@ -60,13 +93,15 @@ async function getGoogleMapsData() {
 
     const pageText = await page.evaluate(() => document.body.innerText);
     const lines = cleanLines(pageText);
-    const routes = extractRoutesFromDirectionsResponse(directionsResponseText);
+    const routes = extractRoutesFromDirectionsResponse(directionsResponseText, source, destination);
     const firstRoute = routes[0] || {};
     const distance = firstRoute.distance || findDistance(lines);
     const duration = firstRoute.duration || findDuration(lines);
 
     return {
       url: googleMapsUrl,
+      source,
+      destination,
       distance: distance || null,
       duration: duration || null,
       polyline: firstRoute.polyline || null,
@@ -148,7 +183,7 @@ function findDuration(lines) {
   );
 }
 
-function extractRoutesFromDirectionsResponse(text) {
+function extractRoutesFromDirectionsResponse(text, origin, destination) {
   if (!text) {
     return [];
   }
@@ -162,7 +197,7 @@ function extractRoutesFromDirectionsResponse(text) {
     }
 
     return routes
-      .map((route, index) => buildRoute(route, index))
+      .map((route, index) => buildRoute(route, index, origin, destination))
       .filter((route) => route.polyline.points.length > 0);
   } catch {
     return [];
@@ -173,9 +208,7 @@ function stripGoogleJsonPrefix(text) {
   return text.replace(/^\)\]\}'\n/, "");
 }
 
-function buildRoute(route, index) {
-  const origin = getUrlCoordinates("origin");
-  const destination = getUrlCoordinates("destination");
+function buildRoute(route, index, origin, destination) {
   const summary = route?.[0];
   const points = extractRoutePoints(route, origin, destination);
 
@@ -188,22 +221,6 @@ function buildRoute(route, index) {
     durationSeconds: summary?.[3]?.[0] || null,
     polyline: buildPolyline(points)
   };
-}
-
-function getUrlCoordinates(key) {
-  const value = new URL(googleMapsUrl).searchParams.get(key);
-
-  if (!value) {
-    return null;
-  }
-
-  const [lat, lng] = value.split(",").map(Number);
-
-  if (!isValidCoordinate(lat, lng)) {
-    return null;
-  }
-
-  return { lat, lng };
 }
 
 function extractRoutePoints(route, origin, destination) {
