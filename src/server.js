@@ -5,6 +5,69 @@ const app = express();
 const port = Number(process.env.PORT) || 3000;
 
 let browserPromise = null;
+const pendingRoutes = new Map();
+const routeCache = new Map();
+
+const ROUTE_TIMEOUT_MS = readPositiveNumberEnv("ROUTE_TIMEOUT_MS", 4000);
+const NAVIGATION_TIMEOUT_MS = ROUTE_TIMEOUT_MS + 1000;
+const ROUTE_CACHE_TTL_MS = readNonNegativeNumberEnv("ROUTE_CACHE_TTL_MS", 5 * 60 * 1000);
+const ROUTE_CACHE_MAX = readPositiveNumberEnv("ROUTE_CACHE_MAX", 500);
+const ROUTE_CACHE_COORD_STEP = 0.00005;
+// Keep scripts and XHR unblocked; Maps needs them to request /maps/preview/directions.
+const BLOCKED_RESOURCE_PATTERNS = [
+  "*.avif*",
+  "*.apng*",
+  "*.bmp*",
+  "*.png*",
+  "*.jpg*",
+  "*.jpeg*",
+  "*.gif*",
+  "*.webp*",
+  "*.svg*",
+  "*.ico*",
+  "*.tif*",
+  "*.tiff*",
+  "*.heic*",
+  "*.heif*",
+  "*.css*",
+  "*.woff*",
+  "*.woff2*",
+  "*.ttf*",
+  "*.otf*",
+  "*.eot*",
+  "*.mp4*",
+  "*.m4v*",
+  "*.mov*",
+  "*.avi*",
+  "*.webm*",
+  "*.ogv*",
+  "*.mp3*",
+  "*.wav*",
+  "*.m4a*",
+  "*.aac*",
+  "*.flac*",
+  "*.opus*",
+  "*://*.doubleclick.net/*",
+  "*://*.google-analytics.com/*",
+  "*://*.googletagmanager.com/*",
+  "*://adservice.google.com/*",
+  "*://googleads.g.doubleclick.net/*",
+  "https://fonts.googleapis.com/*",
+  "https://fonts.gstatic.com/*",
+  "https://lh*.googleusercontent.com/*",
+  "https://geo*.ggpht.com/*",
+  "https://khms*.google.com/*",
+  "https://mt*.google.com/*",
+  "https://play.google.com/log*",
+  "https://streetviewpixels-pa.googleapis.com/*",
+  "https://www.google.com/client_204*",
+  "https://www.google.com/gen_204*",
+  "https://www.google.com/log*",
+  "https://www.gstatic.com/images/*",
+  "https://maps.gstatic.com/*/icons/*",
+  "https://maps.gstatic.com/mapfiles/*",
+  "https://maps.gstatic.com/tactile/*"
+];
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -93,79 +156,115 @@ app.post("/polyline", async (req, res) => {
 
 app.listen(port, () => {
   logInfo("server:started", { port });
+
+  if (process.env.PREWARM_BROWSER !== "false") {
+    getBrowser().catch(() => {});
+  }
 });
 
 /* ================= CORE ================= */
 
 async function fetchRoute(source, destination) {
+  const cacheKey = buildRouteCacheKey(source, destination);
+  const cached = getCachedRoute(cacheKey);
+
+  if (cached) {
+    logInfo("route:cache-hit", { source, destination });
+    return cached;
+  }
+
+  const pending = pendingRoutes.get(cacheKey);
+
+  if (pending) {
+    logInfo("route:join-pending", { source, destination });
+    return pending;
+  }
+
+  const routePromise = fetchRouteUncached(source, destination)
+    .then((data) => {
+      if (data.routes.length > 0) {
+        setCachedRoute(cacheKey, data);
+      }
+
+      return data;
+    })
+    .finally(() => {
+      pendingRoutes.delete(cacheKey);
+    });
+
+  pendingRoutes.set(cacheKey, routePromise);
+  return routePromise;
+}
+
+async function fetchRouteUncached(source, destination) {
   const url = buildGoogleMapsUrl(source, destination);
 
   logInfo("route:start", { source, destination });
 
   const browser = await getBrowser();
   const page = await browser.newPage();
+  let client = null;
+  let finished = false;
 
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const type = req.resourceType();
-    if (["image", "stylesheet", "font", "media"].includes(type)) {
-      req.abort();
-    } else {
-      req.continue();
-    }
-  });
+  try {
+    client = await prepareFastPage(page);
 
-  let resolved = false;
+    const directionsResponse = page
+      .waitForResponse(
+        (response) => response.url().includes("/maps/preview/directions"),
+        { timeout: ROUTE_TIMEOUT_MS }
+      )
+      .then(async (response) => {
+        const text = await response.text();
+        const routes = extractRoutes(text, source, destination);
 
-  return new Promise(async (resolve) => {
-    const timeout = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        logInfo("route:timeout", { source, destination });
-        resolve(emptyResponse(source, destination));
-      }
-    }, 5000);
+        logInfo("route:resolved", {
+          source,
+          destination,
+          routeCount: routes.length
+        });
 
-    page.on("response", async (response) => {
-      if (resolved) return;
-
-      if (response.url().includes("/maps/preview/directions")) {
-        try {
-          const text = await response.text();
-          const routes = extractRoutes(text, source, destination);
-
-          clearTimeout(timeout);
-          resolved = true;
-
-          logInfo("route:resolved", {
-            source,
-            destination,
-            routeCount: routes.length
-          });
-
-          resolve({
-            routes
-          });
-        } catch (e) {
-          logError("route:parse-error", e, { source, destination });
-          resolve(emptyResponse(source, destination));
+        return { routes };
+      })
+      .catch((e) => {
+        if (finished) {
+          return emptyResponse(source, destination);
         }
-      }
-    });
 
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 10000 });
-    } catch (e) {
-      if (!resolved) {
-        clearTimeout(timeout);
-        resolved = true;
-        logError("route:page-load-error", e, { source, destination });
-        resolve(emptyResponse(source, destination));
-      }
+        if (e.name === "TimeoutError") {
+          logInfo("route:timeout", { source, destination });
+        } else {
+          logError("route:parse-error", e, { source, destination });
+        }
+
+        return emptyResponse(source, destination);
+      });
+
+    const pageLoadFailure = page
+      .goto(url, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS })
+      .then(() => new Promise(() => {}))
+      .catch((e) => {
+        if (!finished) {
+          logError("route:page-load-error", e, { source, destination });
+        }
+
+        return emptyResponse(source, destination);
+      });
+
+    const result = await Promise.race([directionsResponse, pageLoadFailure]);
+    finished = true;
+    return result;
+  } finally {
+    if (client) {
+      await client.detach().catch(() => {});
     }
-  }).finally(async () => {
-    await page.close();
-  });
+
+    if (!page.isClosed()) {
+      await page.close().catch((e) => {
+        logError("route:page-close-error", e, { source, destination });
+      });
+    }
+  }
 }
 
 /* ================= BROWSER ================= */
@@ -178,14 +277,46 @@ async function getBrowser() {
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-translate",
+        "--hide-scrollbars",
+        "--mute-audio",
+        "--no-first-run",
+        "--blink-settings=imagesEnabled=false"
       ]
-    });
-    browserPromise
-      .then(() => logInfo("browser:ready"))
-      .catch((e) => logError("browser:error", e));
+    })
+      .then((browser) => {
+        logInfo("browser:ready");
+        browser.on("disconnected", () => {
+          browserPromise = null;
+          logInfo("browser:disconnected");
+        });
+        return browser;
+      })
+      .catch((e) => {
+        browserPromise = null;
+        logError("browser:error", e);
+        throw e;
+      });
   }
   return browserPromise;
+}
+
+async function prepareFastPage(page) {
+  await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 1 });
+  await page.setCacheEnabled(true);
+
+  const client = await page.target().createCDPSession();
+  await client.send("Network.enable");
+  await client.send("Network.setBlockedURLs", {
+    urls: BLOCKED_RESOURCE_PATTERNS
+  });
+
+  return client;
 }
 
 /* ================= PARSER ================= */
@@ -323,6 +454,56 @@ function isValid(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng);
 }
 
+function readPositiveNumberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function readNonNegativeNumberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function buildRouteCacheKey(source, destination) {
+  return `${formatCacheCoordinate(source.lat)},${formatCacheCoordinate(source.lng)}->${formatCacheCoordinate(destination.lat)},${formatCacheCoordinate(destination.lng)}`;
+}
+
+function formatCacheCoordinate(value) {
+  return (Math.round(value / ROUTE_CACHE_COORD_STEP) * ROUTE_CACHE_COORD_STEP).toFixed(5);
+}
+
+function getCachedRoute(key) {
+  if (ROUTE_CACHE_TTL_MS === 0) return null;
+
+  const cached = routeCache.get(key);
+
+  if (!cached) return null;
+
+  if (cached.expiresAt <= Date.now()) {
+    routeCache.delete(key);
+    return null;
+  }
+
+  routeCache.delete(key);
+  routeCache.set(key, cached);
+  return cached.data;
+}
+
+function setCachedRoute(key, data) {
+  if (ROUTE_CACHE_TTL_MS === 0) return;
+
+  routeCache.delete(key);
+  routeCache.set(key, {
+    data,
+    expiresAt: Date.now() + ROUTE_CACHE_TTL_MS
+  });
+
+  while (routeCache.size > ROUTE_CACHE_MAX) {
+    const oldestKey = routeCache.keys().next().value;
+    routeCache.delete(oldestKey);
+  }
+}
+
 function logInfo(message, details = {}) {
   console.log(formatLog("info", message, details));
 }
@@ -348,7 +529,7 @@ function formatLog(level, message, details = {}) {
 }
 
 function buildGoogleMapsUrl(s, d) {
-  return `https://www.google.com/maps/dir/?api=1&origin=${s.lat},${s.lng}&destination=${d.lat},${d.lng}`;
+  return `https://www.google.com/maps/dir/${s.lat},${s.lng}/${d.lat},${d.lng}`;
 }
 
 function emptyResponse(source, destination) {
