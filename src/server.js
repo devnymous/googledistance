@@ -8,20 +8,48 @@ let browserPromise = null;
 
 app.use(express.json());
 
-app.post("/google", async (req, res) => {
+/* ================= ROUTES ================= */
+
+// ✅ 1. Distance API
+app.post("/distance", async (req, res) => {
   try {
-    const source = parseRequestCoordinate(req.body.source, "source");
-    const destination = parseRequestCoordinate(req.body.destination, "destination");
+    const { source, destination } = parseInput(req);
 
-    const url = buildGoogleMapsUrl(source, destination);
+    const data = await fetchRoute(source, destination);
 
-    const data = await getGoogleMapsData(url, source, destination);
+    const first = data.routes[0] || {};
 
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.json({
+      source,
+      destination,
+      distance: first.distance || null,
+      duration: first.duration || null
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
+
+// ✅ 2. Polyline API
+app.post("/polyline", async (req, res) => {
+  try {
+    const { source, destination } = parseInput(req);
+
+    const data = await fetchRoute(source, destination);
+
+    const first = data.routes[0] || {};
+
+    res.json({
+      source,
+      destination,
+      polyline: first.polyline || null
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================= SERVER ================= */
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
@@ -29,11 +57,12 @@ app.listen(port, () => {
 
 /* ================= CORE ================= */
 
-async function getGoogleMapsData(url, source, destination) {
+async function fetchRoute(source, destination) {
+  const url = buildGoogleMapsUrl(source, destination);
+
   const browser = await getBrowser();
   const page = await browser.newPage();
 
-  // 🚀 Block heavy resources
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     const type = req.resourceType();
@@ -46,7 +75,7 @@ async function getGoogleMapsData(url, source, destination) {
 
   let resolved = false;
 
-  return new Promise(async (resolve, reject) => {
+  return new Promise(async (resolve) => {
     const timeout = setTimeout(() => {
       if (!resolved) {
         resolved = true;
@@ -60,29 +89,21 @@ async function getGoogleMapsData(url, source, destination) {
       if (response.url().includes("/maps/preview/directions")) {
         try {
           const text = await response.text();
-
           const routes = extractRoutes(text, source, destination);
-          const first = routes[0] || {};
 
           clearTimeout(timeout);
           resolved = true;
 
           resolve({
-            url,
-            source,
-            destination,
-            distance: first.distance || null,
-            duration: first.duration || null,
-            polyline: first.polyline || null,
             routes
           });
-        } catch (e) {
-          reject(e);
+        } catch {
+          resolve(emptyResponse(source, destination));
         }
       }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 10000 });
   }).finally(async () => {
     await page.close();
   });
@@ -101,18 +122,17 @@ async function getBrowser() {
       ]
     });
   }
-
   return browserPromise;
 }
 
-/* ================= ROUTE PARSER ================= */
+/* ================= PARSER ================= */
 
 function extractRoutes(text, origin, destination) {
   try {
     const data = JSON.parse(text.replace(/^\)\]\}'\n/, ""));
     const routes = data?.[0]?.[1] || [];
 
-    return routes.map((route, i) => buildRoute(route, i, origin, destination));
+    return routes.map((r, i) => buildRoute(r, i, origin, destination));
   } catch {
     return [];
   }
@@ -124,7 +144,6 @@ function buildRoute(route, index, origin, destination) {
 
   return {
     index,
-    name: summary?.[1] || null,
     distance: summary?.[2]?.[1] || null,
     duration: summary?.[3]?.[1] || null,
     polyline: buildPolyline(points)
@@ -179,7 +198,6 @@ function cleanPoints(points) {
 function buildPolyline(points) {
   return {
     pointCount: points.length,
-    points,
     encoded: encodePolyline(points)
   };
 }
@@ -220,12 +238,19 @@ function encode(num) {
 
 /* ================= HELPERS ================= */
 
-function parseRequestCoordinate(v, name) {
+function parseInput(req) {
+  return {
+    source: parseRequestCoordinate(req.body.source),
+    destination: parseRequestCoordinate(req.body.destination)
+  };
+}
+
+function parseRequestCoordinate(v) {
   const lat = Number(v?.lat);
   const lng = Number(v?.lng);
 
   if (!isValid(lat, lng)) {
-    throw new Error(`${name} invalid`);
+    throw new Error("Invalid coordinates");
   }
 
   return { lat, lng };
@@ -241,11 +266,6 @@ function buildGoogleMapsUrl(s, d) {
 
 function emptyResponse(source, destination) {
   return {
-    source,
-    destination,
-    distance: null,
-    duration: null,
-    polyline: null,
     routes: []
   };
 }
