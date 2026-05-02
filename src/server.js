@@ -1,15 +1,13 @@
 const express = require("express");
-const fs = require("fs/promises");
-const path = require("path");
 const puppeteer = require("puppeteer-core");
 
 const app = express();
 const port = 3000;
 const googleMapsUrl =
   "https://www.google.com/maps/dir/?api=1&origin=9.8192117,99.9964583&destination=9.712199862086026,99.98672318780132&travelmode=driving";
-const outputFile = path.join(__dirname, "..", "google-response.txt");
 const chromePath =
   process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+let browserPromise = null;
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
@@ -17,13 +15,11 @@ app.get("/", (req, res) => {
 
 app.get("/google", async (req, res) => {
   try {
-    const text = await getGoogleMapsText();
+    const data = await getGoogleMapsData();
 
-    await fs.writeFile(outputFile, text, "utf8");
-
-    res.type("text").send(text);
+    res.json(data);
   } catch (error) {
-    res.status(500).send(error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -31,16 +27,14 @@ app.listen(port, () => {
   console.log(`Example app listening on port localhost:${port}`);
 });
 
-async function getGoogleMapsText() {
-  const browser = await puppeteer.launch({
-    executablePath: chromePath,
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-  });
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+async function getGoogleMapsData() {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
 
   try {
-    const page = await browser.newPage();
-
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent(
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -56,18 +50,48 @@ async function getGoogleMapsText() {
     const distance = findDistance(lines);
     const duration = findDuration(lines);
 
-    return [
-      "Google Maps Rendered Text",
-      `URL: ${googleMapsUrl}`,
-      `Distance: ${distance || "Not found"}`,
-      `Duration: ${duration || "Not found"}`,
-      "",
-      "Full Text:",
-      lines.join("\n")
-    ].join("\n");
+    return {
+      url: googleMapsUrl,
+      distance: distance || null,
+      duration: duration || null,
+      fullText: lines
+    };
   } finally {
+    await page.close();
+  }
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = puppeteer
+      .launch({
+        executablePath: chromePath,
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+      })
+      .catch((error) => {
+        browserPromise = null;
+        throw error;
+      });
+  }
+
+  const browser = await browserPromise;
+
+  if (!browser.isConnected()) {
+    browserPromise = null;
+    return getBrowser();
+  }
+
+  return browser;
+}
+
+async function shutdown() {
+  if (browserPromise) {
+    const browser = await browserPromise;
     await browser.close();
   }
+
+  process.exit(0);
 }
 
 async function waitForRouteText(page) {
