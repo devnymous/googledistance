@@ -1,0 +1,13 @@
+{
+  "name": "googledistance",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.21.2",
+    "puppeteer-core": "^24.42.0"
+  }
+}
