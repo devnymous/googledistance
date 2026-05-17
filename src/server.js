@@ -7,12 +7,16 @@ const port = Number(process.env.PORT) || 3000;
 let browserPromise = null;
 const pendingRoutes = new Map();
 const routeCache = new Map();
+const pagePool = [];
+const pageWaitQueue = [];
+let pagePoolPromise = null;
 
 const ROUTE_TIMEOUT_MS = readPositiveNumberEnv("ROUTE_TIMEOUT_MS", 4000);
 const NAVIGATION_TIMEOUT_MS = ROUTE_TIMEOUT_MS + 1000;
 const ROUTE_CACHE_TTL_MS = readNonNegativeNumberEnv("ROUTE_CACHE_TTL_MS", 5 * 60 * 1000);
 const ROUTE_CACHE_MAX = readPositiveNumberEnv("ROUTE_CACHE_MAX", 500);
 const ROUTE_CACHE_COORD_STEP = 0.00005;
+const PAGE_POOL_SIZE = readPositiveNumberEnv("PAGE_POOL_SIZE", 5);
 // Keep scripts and XHR unblocked; Maps needs them to request /maps/preview/directions.
 const BLOCKED_RESOURCE_PATTERNS = [
   "*.avif*",
@@ -103,18 +107,20 @@ app.post("/distance", async (req, res) => {
 
     const first = data.routes[0] || {};
 
+    const distanceKm = parseDistanceToKm(first.distance);
+
     logInfo("distance:success", {
       source,
       destination,
       routeCount: data.routes.length,
-      distance: first.distance || null,
+      distanceKm,
       duration: first.duration || null
     });
 
     res.json({
       source,
       destination,
-      distance: first.distance || null,
+      distance: distanceKm,
       duration: first.duration || null
     });
   } catch (e) {
@@ -158,7 +164,9 @@ app.listen(port, () => {
   logInfo("server:started", { port });
 
   if (process.env.PREWARM_BROWSER !== "false") {
-    getBrowser().catch(() => {});
+    getBrowser()
+      .then(initPagePool)
+      .catch(() => {});
   }
 });
 
@@ -202,13 +210,11 @@ async function fetchRouteUncached(source, destination) {
   logInfo("route:start", { source, destination });
 
   const browser = await getBrowser();
-  const page = await browser.newPage();
-  let client = null;
+  const pooledPage = await acquirePage(browser);
+  const page = pooledPage.page;
   let finished = false;
 
   try {
-    client = await prepareFastPage(page);
-
     const directionsResponse = page
       .waitForResponse(
         (response) => response.url().includes("/maps/preview/directions"),
@@ -255,15 +261,7 @@ async function fetchRouteUncached(source, destination) {
     finished = true;
     return result;
   } finally {
-    if (client) {
-      await client.detach().catch(() => {});
-    }
-
-    if (!page.isClosed()) {
-      await page.close().catch((e) => {
-        logError("route:page-close-error", e, { source, destination });
-      });
-    }
+    await releasePage(pooledPage, { source, destination });
   }
 }
 
@@ -293,6 +291,7 @@ async function getBrowser() {
         logInfo("browser:ready");
         browser.on("disconnected", () => {
           browserPromise = null;
+          resetPagePool();
           logInfo("browser:disconnected");
         });
         return browser;
@@ -304,6 +303,166 @@ async function getBrowser() {
       });
   }
   return browserPromise;
+}
+
+async function initPagePool(browser) {
+  if (pagePool.length >= PAGE_POOL_SIZE) return;
+  if (pagePoolPromise) return pagePoolPromise;
+
+  pagePoolPromise = (async () => {
+    if (pagePool.length >= PAGE_POOL_SIZE) return;
+
+    logInfo("page-pool:init", { size: PAGE_POOL_SIZE });
+
+    while (pagePool.length < PAGE_POOL_SIZE) {
+      const page = await browser.newPage();
+      await prepareFastPage(page);
+
+      const pooledPage = {
+        id: pagePool.length + 1,
+        page,
+        busy: false
+      };
+
+      page.on("close", () => {
+        removePageFromPool(pooledPage);
+      });
+
+      pagePool.push(pooledPage);
+    }
+
+    logInfo("page-pool:ready", { size: pagePool.length });
+  })().catch((e) => {
+    logError("page-pool:error", e);
+    throw e;
+  }).finally(() => {
+    pagePoolPromise = null;
+  });
+
+  return pagePoolPromise;
+}
+
+async function acquirePage(browser) {
+  await initPagePool(browser);
+
+  const availablePage = pagePool.find((pooledPage) => {
+    return !pooledPage.busy && !pooledPage.page.isClosed();
+  });
+
+  if (availablePage) {
+    availablePage.busy = true;
+    logInfo("page-pool:acquire", { id: availablePage.id });
+    return availablePage;
+  }
+
+  logInfo("page-pool:queue", {
+    busy: pagePool.filter((pooledPage) => pooledPage.busy).length,
+    queue: pageWaitQueue.length + 1
+  });
+
+  return new Promise((resolve, reject) => {
+    pageWaitQueue.push({ resolve, reject });
+  });
+}
+
+async function releasePage(pooledPage, details = {}) {
+  if (!pooledPage) return;
+
+  if (pooledPage.page.isClosed()) {
+    await replacePooledPage(pooledPage);
+    return;
+  }
+
+  if (!pooledPage.page.isClosed()) {
+    try {
+      await pooledPage.page.goto("about:blank", {
+        waitUntil: "domcontentloaded",
+        timeout: 1000
+      });
+    } catch (e) {
+      logError("page-pool:reset-error", e, {
+        id: pooledPage.id,
+        ...details
+      });
+      await replacePooledPage(pooledPage);
+      return;
+    }
+  }
+
+  pooledPage.busy = false;
+  assignPageToWaitingRequest(pooledPage);
+}
+
+function assignPageToWaitingRequest(pooledPage) {
+  const waiter = pageWaitQueue.shift();
+
+  if (!waiter) {
+    logInfo("page-pool:release", { id: pooledPage.id });
+    return;
+  }
+
+  if (pooledPage.page.isClosed()) {
+    waiter.reject(new Error("Pooled page closed"));
+    return;
+  }
+
+  pooledPage.busy = true;
+  logInfo("page-pool:handoff", {
+    id: pooledPage.id,
+    queue: pageWaitQueue.length
+  });
+  waiter.resolve(pooledPage);
+}
+
+async function replacePooledPage(pooledPage) {
+  removePageFromPool(pooledPage);
+
+  try {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    await prepareFastPage(page);
+
+    const replacement = {
+      id: pooledPage.id,
+      page,
+      busy: false
+    };
+
+    page.on("close", () => {
+      removePageFromPool(replacement);
+    });
+
+    pagePool.push(replacement);
+    assignPageToWaitingRequest(replacement);
+  } catch (e) {
+    logError("page-pool:replace-error", e, { id: pooledPage.id });
+    rejectNextPageWaiter(e);
+  }
+}
+
+function removePageFromPool(pooledPage) {
+  const index = pagePool.indexOf(pooledPage);
+
+  if (index !== -1) {
+    pagePool.splice(index, 1);
+  }
+}
+
+function rejectNextPageWaiter(error) {
+  const waiter = pageWaitQueue.shift();
+
+  if (waiter) {
+    waiter.reject(error);
+  }
+}
+
+function resetPagePool() {
+  pagePool.length = 0;
+  pagePoolPromise = null;
+
+  while (pageWaitQueue.length > 0) {
+    rejectNextPageWaiter(new Error("Browser disconnected"));
+  }
 }
 
 async function prepareFastPage(page) {
@@ -452,6 +611,35 @@ function parseRequestCoordinate(v) {
 
 function isValid(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng);
+}
+
+function parseDistanceToKm(distanceText) {
+  if (distanceText == null) return null;
+  if (typeof distanceText === "number" && Number.isFinite(distanceText)) return distanceText;
+  if (typeof distanceText !== "string") return null;
+
+  const normalized = distanceText.replace(/,/g, "").trim();
+  const match = normalized.match(/([\d.]+)\s*(mi|km|m|ft|yd)\b/i);
+
+  if (!match) return null;
+
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) return null;
+
+  switch (match[2].toLowerCase()) {
+    case "km":
+      return value;
+    case "m":
+      return value / 1000;
+    case "mi":
+      return value * 1.609344;
+    case "ft":
+      return value * 0.0003048;
+    case "yd":
+      return value * 0.0009144;
+    default:
+      return null;
+  }
 }
 
 function readPositiveNumberEnv(name, fallback) {
