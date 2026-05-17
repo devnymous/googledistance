@@ -1,3 +1,4 @@
+const cors = require("cors");
 const express = require("express");
 const puppeteer = require("puppeteer");
 
@@ -73,6 +74,7 @@ const BLOCKED_RESOURCE_PATTERNS = [
   "https://maps.gstatic.com/tactile/*"
 ];
 
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use((req, res, next) => {
   const startedAt = Date.now();
@@ -97,7 +99,7 @@ app.use((req, res, next) => {
 /* ================= ROUTES ================= */
 
 // ✅ 1. Distance API
-app.post("/distance", async (req, res) => {
+app.get("/distance", async (req, res) => {
   try {
     const { source, destination } = parseInput(req);
 
@@ -130,7 +132,7 @@ app.post("/distance", async (req, res) => {
 });
 
 // ✅ 2. Polyline API
-app.post("/polyline", async (req, res) => {
+app.get("/polyline", async (req, res) => {
   try {
     const { source, destination } = parseInput(req);
 
@@ -592,9 +594,52 @@ function encode(num) {
 /* ================= HELPERS ================= */
 
 function parseInput(req) {
+  const query = req.query || {};
   return {
-    source: parseRequestCoordinate(req.body.source),
-    destination: parseRequestCoordinate(req.body.destination)
+    source: parseRequestCoordinate(getQueryCoordinate(query, "source")),
+    destination: parseRequestCoordinate(getQueryCoordinate(query, "destination"))
+  };
+}
+
+function getQueryCoordinate(query, name) {
+  const pair = parseLatLngPair(getQueryValue(query, name));
+  if (pair) return pair;
+
+  let lat = getQueryValue(query, `${name}Lat`);
+  let lng = getQueryValue(query, `${name}Lng`);
+
+  if (lat == null) lat = getQueryValue(query, `${name}_lat`);
+  if (lng == null) lng = getQueryValue(query, `${name}_lng`);
+
+  if ((lat == null || lng == null) && name === "destination") {
+    const altLat = getQueryValue(query, "destLat") ?? getQueryValue(query, "dest_lat");
+    const altLng = getQueryValue(query, "destLng") ?? getQueryValue(query, "dest_lng");
+    if (altLat != null || altLng != null) {
+      lat = altLat;
+      lng = altLng;
+    }
+  }
+
+  return { lat, lng };
+}
+
+function getQueryValue(query, key) {
+  const value = query[key];
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function parseLatLngPair(value) {
+  if (value == null) return null;
+  const text = Array.isArray(value) ? value[0] : value;
+  if (text == null) return null;
+
+  const parts = String(text).split(",");
+  if (parts.length !== 2) return null;
+
+  return {
+    lat: parts[0].trim(),
+    lng: parts[1].trim()
   };
 }
 

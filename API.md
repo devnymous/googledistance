@@ -9,22 +9,29 @@ JSON HTTP API that returns distance, duration, and route polylines by scraping G
 
 ## Content Type
 
-- Request: application/json
+- Request: none (query parameters)
 - Response: application/json
 
 ## Endpoints
 
-### POST /distance
+### GET /distance
 
 Returns the distance and duration for the first route between two coordinates.
 
-Request body:
+Query parameters:
 
-```json
-{
-  "source": { "lat": 37.7749, "lng": -122.4194 },
-  "destination": { "lat": 34.0522, "lng": -118.2437 }
-}
+- `sourceLat` and `sourceLng`
+- `destinationLat` and `destinationLng`
+
+Alternate query format (also accepted):
+
+- `source=lat,lng`
+- `destination=lat,lng`
+
+Example:
+
+```
+/distance?sourceLat=37.7749&sourceLng=-122.4194&destinationLat=34.0522&destinationLng=-118.2437
 ```
 
 Response body:
@@ -43,17 +50,24 @@ Notes:
 - `duration` is a human-readable string when available, otherwise `null`.
 - If no routes are available or parsing times out, `distance` and `duration` are `null`.
 
-### POST /polyline
+### GET /polyline
 
 Returns the encoded polyline for the first route between two coordinates.
 
-Request body:
+Query parameters:
 
-```json
-{
-  "source": { "lat": 37.7749, "lng": -122.4194 },
-  "destination": { "lat": 34.0522, "lng": -118.2437 }
-}
+- `sourceLat` and `sourceLng`
+- `destinationLat` and `destinationLng`
+
+Alternate query format (also accepted):
+
+- `source=lat,lng`
+- `destination=lat,lng`
+
+Example:
+
+```
+/polyline?sourceLat=37.7749&sourceLng=-122.4194&destinationLat=34.0522&destinationLng=-118.2437
 ```
 
 Response body:
@@ -86,15 +100,11 @@ Invalid coordinates are returned when any `lat` or `lng` is missing or not a fin
 ## Examples
 
 ```bash
-curl -sS http://localhost:3000/distance \
-  -H "Content-Type: application/json" \
-  -d '{"source":{"lat":37.7749,"lng":-122.4194},"destination":{"lat":34.0522,"lng":-118.2437}}'
+curl -sS "http://localhost:3000/distance?sourceLat=37.7749&sourceLng=-122.4194&destinationLat=34.0522&destinationLng=-118.2437"
 ```
 
 ```bash
-curl -sS http://localhost:3000/polyline \
-  -H "Content-Type: application/json" \
-  -d '{"source":{"lat":37.7749,"lng":-122.4194},"destination":{"lat":34.0522,"lng":-118.2437}}'
+curl -sS "http://localhost:3000/polyline?sourceLat=37.7749&sourceLng=-122.4194&destinationLat=34.0522&destinationLng=-118.2437"
 ```
 
 ## Environment Variables
