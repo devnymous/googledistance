@@ -18,6 +18,8 @@ const ROUTE_CACHE_TTL_MS = readNonNegativeNumberEnv("ROUTE_CACHE_TTL_MS", 5 * 60
 const ROUTE_CACHE_MAX = readPositiveNumberEnv("ROUTE_CACHE_MAX", 500);
 const ROUTE_CACHE_COORD_STEP = 0.00005;
 const PAGE_POOL_SIZE = readPositiveNumberEnv("PAGE_POOL_SIZE", 5);
+const DEFAULT_TRAVEL_MODE = "driving";
+const TRAVEL_MODES = new Set(["driving", "walking", "bicycling", "transit"]);
 // Keep scripts and XHR unblocked; Maps needs them to request /maps/preview/directions.
 const BLOCKED_RESOURCE_PATTERNS = [
   "*.avif*",
@@ -101,29 +103,34 @@ app.use((req, res, next) => {
 // ✅ 1. Distance API
 app.get("/distance", async (req, res) => {
   try {
-    const { source, destination } = parseInput(req);
+    const { source, destination, travelMode } = parseInput(req);
+    const googleMapUrl = buildGoogleMapsUrl(source, destination, travelMode);
 
-    logInfo("distance:fetch", { source, destination });
+    logInfo("distance:fetch", { source, destination, travelMode });
 
-    const data = await fetchRoute(source, destination);
+    const data = await fetchRoute(source, destination, travelMode);
 
-    const first = data.routes[0] || {};
+    const selectedRoute = selectShortestRoute(data.routes);
 
-    const distanceKm = parseDistanceToKm(first.distance);
+    const distanceKm = parseDistanceToKm(selectedRoute.distance);
 
     logInfo("distance:success", {
       source,
       destination,
+      travelMode,
       routeCount: data.routes.length,
+      routeIndex: selectedRoute.index ?? null,
       distanceKm,
-      duration: first.duration || null
+      duration: selectedRoute.duration || null
     });
 
     res.json({
       source,
       destination,
+      travelMode,
+      googleMapUrl,
       distance: distanceKm,
-      duration: first.duration || null
+      duration: selectedRoute.duration || null
     });
   } catch (e) {
     logError("distance:error", e, { body: req.body });
@@ -134,25 +141,30 @@ app.get("/distance", async (req, res) => {
 // ✅ 2. Polyline API
 app.get("/polyline", async (req, res) => {
   try {
-    const { source, destination } = parseInput(req);
+    const { source, destination, travelMode } = parseInput(req);
+    const googleMapUrl = buildGoogleMapsUrl(source, destination, travelMode);
 
-    logInfo("polyline:fetch", { source, destination });
+    logInfo("polyline:fetch", { source, destination, travelMode });
 
-    const data = await fetchRoute(source, destination);
+    const data = await fetchRoute(source, destination, travelMode);
 
-    const first = data.routes[0] || {};
+    const selectedRoute = selectShortestRoute(data.routes);
 
     logInfo("polyline:success", {
       source,
       destination,
+      travelMode,
       routeCount: data.routes.length,
-      pointCount: first.polyline?.pointCount || 0
+      routeIndex: selectedRoute.index ?? null,
+      pointCount: selectedRoute.polyline?.pointCount || 0
     });
 
     res.json({
       source,
       destination,
-      polyline: first.polyline || null
+      travelMode,
+      googleMapUrl,
+      polyline: selectedRoute.polyline || null
     });
   } catch (e) {
     logError("polyline:error", e, { body: req.body });
@@ -174,23 +186,23 @@ app.listen(port, () => {
 
 /* ================= CORE ================= */
 
-async function fetchRoute(source, destination) {
-  const cacheKey = buildRouteCacheKey(source, destination);
+async function fetchRoute(source, destination, travelMode) {
+  const cacheKey = buildRouteCacheKey(source, destination, travelMode);
   const cached = getCachedRoute(cacheKey);
 
   if (cached) {
-    logInfo("route:cache-hit", { source, destination });
+    logInfo("route:cache-hit", { source, destination, travelMode });
     return cached;
   }
 
   const pending = pendingRoutes.get(cacheKey);
 
   if (pending) {
-    logInfo("route:join-pending", { source, destination });
+    logInfo("route:join-pending", { source, destination, travelMode });
     return pending;
   }
 
-  const routePromise = fetchRouteUncached(source, destination)
+  const routePromise = fetchRouteUncached(source, destination, travelMode)
     .then((data) => {
       if (data.routes.length > 0) {
         setCachedRoute(cacheKey, data);
@@ -206,10 +218,10 @@ async function fetchRoute(source, destination) {
   return routePromise;
 }
 
-async function fetchRouteUncached(source, destination) {
-  const url = buildGoogleMapsUrl(source, destination);
+async function fetchRouteUncached(source, destination, travelMode) {
+  const url = buildGoogleMapsUrl(source, destination, travelMode);
 
-  logInfo("route:start", { source, destination });
+  logInfo("route:start", { source, destination, travelMode });
 
   const browser = await getBrowser();
   const pooledPage = await acquirePage(browser);
@@ -229,6 +241,7 @@ async function fetchRouteUncached(source, destination) {
         logInfo("route:resolved", {
           source,
           destination,
+          travelMode,
           routeCount: routes.length
         });
 
@@ -240,9 +253,9 @@ async function fetchRouteUncached(source, destination) {
         }
 
         if (e.name === "TimeoutError") {
-          logInfo("route:timeout", { source, destination });
+          logInfo("route:timeout", { source, destination, travelMode });
         } else {
-          logError("route:parse-error", e, { source, destination });
+          logError("route:parse-error", e, { source, destination, travelMode });
         }
 
         return emptyResponse(source, destination);
@@ -253,7 +266,7 @@ async function fetchRouteUncached(source, destination) {
       .then(() => new Promise(() => {}))
       .catch((e) => {
         if (!finished) {
-          logError("route:page-load-error", e, { source, destination });
+          logError("route:page-load-error", e, { source, destination, travelMode });
         }
 
         return emptyResponse(source, destination);
@@ -263,7 +276,7 @@ async function fetchRouteUncached(source, destination) {
     finished = true;
     return result;
   } finally {
-    await releasePage(pooledPage, { source, destination });
+    await releasePage(pooledPage, { source, destination, travelMode });
   }
 }
 
@@ -505,6 +518,20 @@ function buildRoute(route, index, origin, destination) {
   };
 }
 
+function selectShortestRoute(routes) {
+  if (!Array.isArray(routes) || routes.length === 0) return {};
+
+  return routes.reduce((shortest, route) => {
+    const shortestDistance = parseDistanceToKm(shortest.distance);
+    const routeDistance = parseDistanceToKm(route.distance);
+
+    if (shortestDistance == null) return routeDistance == null ? shortest : route;
+    if (routeDistance == null) return shortest;
+
+    return routeDistance < shortestDistance ? route : shortest;
+  }, routes[0]);
+}
+
 /* ================= POLYLINE ================= */
 
 function extractPoints(route, origin, destination) {
@@ -597,7 +624,8 @@ function parseInput(req) {
   const query = req.query || {};
   return {
     source: parseRequestCoordinate(getQueryCoordinate(query, "source")),
-    destination: parseRequestCoordinate(getQueryCoordinate(query, "destination"))
+    destination: parseRequestCoordinate(getQueryCoordinate(query, "destination")),
+    travelMode: parseTravelMode(getQueryValue(query, "mode"))
   };
 }
 
@@ -654,6 +682,18 @@ function parseRequestCoordinate(v) {
   return { lat, lng };
 }
 
+function parseTravelMode(value) {
+  if (value == null || value === "") return DEFAULT_TRAVEL_MODE;
+
+  const travelMode = String(value).trim().toLowerCase();
+
+  if (!TRAVEL_MODES.has(travelMode)) {
+    throw new Error(`Invalid mode. Use one of: ${Array.from(TRAVEL_MODES).join(", ")}`);
+  }
+
+  return travelMode;
+}
+
 function isValid(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng);
 }
@@ -697,8 +737,8 @@ function readNonNegativeNumberEnv(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function buildRouteCacheKey(source, destination) {
-  return `${formatCacheCoordinate(source.lat)},${formatCacheCoordinate(source.lng)}->${formatCacheCoordinate(destination.lat)},${formatCacheCoordinate(destination.lng)}`;
+function buildRouteCacheKey(source, destination, travelMode) {
+  return `${travelMode}:${formatCacheCoordinate(source.lat)},${formatCacheCoordinate(source.lng)}->${formatCacheCoordinate(destination.lat)},${formatCacheCoordinate(destination.lng)}`;
 }
 
 function formatCacheCoordinate(value) {
@@ -761,8 +801,12 @@ function formatLog(level, message, details = {}) {
   });
 }
 
-function buildGoogleMapsUrl(s, d) {
-  return `https://www.google.com/maps/dir/${s.lat},${s.lng}/${d.lat},${d.lng}`;
+function buildGoogleMapsUrl(s, d, travelMode = DEFAULT_TRAVEL_MODE) {
+  const origin = encodeURIComponent(`${s.lat},${s.lng}`);
+  const destination = encodeURIComponent(`${d.lat},${d.lng}`);
+  const mode = encodeURIComponent(travelMode);
+
+  return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}&travelmode=${mode}`;
 }
 
 function emptyResponse(source, destination) {

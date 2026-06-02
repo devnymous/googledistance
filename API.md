@@ -16,12 +16,13 @@ JSON HTTP API that returns distance, duration, and route polylines by scraping G
 
 ### GET /distance
 
-Returns the distance and duration for the first route between two coordinates.
+Returns the distance and duration for the shortest route between two coordinates.
 
 Query parameters:
 
 - `sourceLat` and `sourceLng`
 - `destinationLat` and `destinationLng`
+- `mode` (optional): `walking` (default), `driving`, `bicycling`, or `transit`
 
 Alternate query format (also accepted):
 
@@ -40,6 +41,8 @@ Response body:
 {
   "source": { "lat": 37.7749, "lng": -122.4194 },
   "destination": { "lat": 34.0522, "lng": -118.2437 },
+  "travelMode": "walking",
+  "googleMapUrl": "https://www.google.com/maps/dir/?api=1&origin=37.7749%2C-122.4194&destination=34.0522%2C-118.2437&travelmode=walking",
   "distance": 612.9,
   "duration": "5 hr 52 min"
 }
@@ -49,15 +52,17 @@ Notes:
 - `distance` is a number in kilometers. Example: `0.54` means 540 meters.
 - `duration` is a human-readable string when available, otherwise `null`.
 - If no routes are available or parsing times out, `distance` and `duration` are `null`.
+- The default travel mode is walking. Use `mode=driving` for car routes.
 
 ### GET /polyline
 
-Returns the encoded polyline for the first route between two coordinates.
+Returns the encoded polyline for the shortest route between two coordinates.
 
 Query parameters:
 
 - `sourceLat` and `sourceLng`
 - `destinationLat` and `destinationLng`
+- `mode` (optional): `walking` (default), `driving`, `bicycling`, or `transit`
 
 Alternate query format (also accepted):
 
@@ -76,6 +81,8 @@ Response body:
 {
   "source": { "lat": 37.7749, "lng": -122.4194 },
   "destination": { "lat": 34.0522, "lng": -118.2437 },
+  "travelMode": "walking",
+  "googleMapUrl": "https://www.google.com/maps/dir/?api=1&origin=37.7749%2C-122.4194&destination=34.0522%2C-118.2437&travelmode=walking",
   "polyline": {
     "pointCount": 128,
     "encoded": "{polyline-string}"
