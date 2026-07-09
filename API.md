@@ -1,6 +1,6 @@
 # Google Distance API
 
-JSON HTTP API that returns distance, duration, and route polylines by scraping Google Maps directions.
+JSON HTTP API that returns distance, duration, and route polylines by scraping Google Maps directions over HTTP.
 
 ## Base URL
 
@@ -22,7 +22,7 @@ Query parameters:
 
 - `sourceLat` and `sourceLng`
 - `destinationLat` and `destinationLng`
-- `mode` (optional): `walking` (default), `driving`, `bicycling`, or `transit`
+- `mode` (optional): `driving` (default), `walking`, `bicycling`, or `transit`
 
 Alternate query format (also accepted):
 
@@ -41,18 +41,20 @@ Response body:
 {
   "source": { "lat": 37.7749, "lng": -122.4194 },
   "destination": { "lat": 34.0522, "lng": -118.2437 },
-  "travelMode": "walking",
-  "googleMapUrl": "https://www.google.com/maps/dir/?api=1&origin=37.7749%2C-122.4194&destination=34.0522%2C-118.2437&travelmode=walking",
+  "travelMode": "driving",
+  "googleMapUrl": "https://www.google.com/maps/dir/?api=1&origin=37.7749%2C-122.4194&destination=34.0522%2C-118.2437&travelmode=driving",
   "distance": 612.9,
-  "duration": "5 hr 52 min"
+  "duration": "5 hr 52 min",
+  "processingTimeMs": 1830
 }
 ```
 
 Notes:
 - `distance` is a number in kilometers. Example: `0.54` means 540 meters.
 - `duration` is a human-readable string when available, otherwise `null`.
+- `processingTimeMs` is the server-side time spent processing the request.
 - If no routes are available or parsing times out, `distance` and `duration` are `null`.
-- The default travel mode is walking. Use `mode=driving` for car routes.
+- The default travel mode is driving. Use `mode=walking` for walking routes.
 
 ### GET /polyline
 
@@ -62,7 +64,7 @@ Query parameters:
 
 - `sourceLat` and `sourceLng`
 - `destinationLat` and `destinationLng`
-- `mode` (optional): `walking` (default), `driving`, `bicycling`, or `transit`
+- `mode` (optional): `driving` (default), `walking`, `bicycling`, or `transit`
 
 Alternate query format (also accepted):
 
@@ -81,25 +83,30 @@ Response body:
 {
   "source": { "lat": 37.7749, "lng": -122.4194 },
   "destination": { "lat": 34.0522, "lng": -118.2437 },
-  "travelMode": "walking",
-  "googleMapUrl": "https://www.google.com/maps/dir/?api=1&origin=37.7749%2C-122.4194&destination=34.0522%2C-118.2437&travelmode=walking",
+  "travelMode": "driving",
+  "googleMapUrl": "https://www.google.com/maps/dir/?api=1&origin=37.7749%2C-122.4194&destination=34.0522%2C-118.2437&travelmode=driving",
   "polyline": {
     "pointCount": 128,
     "encoded": "{polyline-string}"
-  }
+  },
+  "processingTimeMs": 1830
 }
 ```
 
 Notes:
 - `polyline` is `null` if no routes are available or parsing times out.
 - `pointCount` is the number of decoded points used to build the polyline.
+- `processingTimeMs` is the server-side time spent processing the request.
 
 ## Errors
 
 All errors return status `500` and a JSON body:
 
 ```json
-{ "error": "Invalid coordinates" }
+{
+  "error": "Invalid coordinates",
+  "processingTimeMs": 1
+}
 ```
 
 Invalid coordinates are returned when any `lat` or `lng` is missing or not a finite number.
@@ -117,11 +124,9 @@ curl -sS "http://localhost:3000/polyline?sourceLat=37.7749&sourceLng=-122.4194&d
 ## Environment Variables
 
 - `PORT` (default: 3000): HTTP server port.
-- `PREWARM_BROWSER` (default: true): set to `false` to skip browser prewarm on startup.
-- `ROUTE_TIMEOUT_MS` (default: 4000): wait time for the Google Maps directions response.
+- `ROUTE_TIMEOUT_MS` (default: 4000): wait time for the Google Maps HTTP responses.
 - `ROUTE_CACHE_TTL_MS` (default: 300000): cache duration in milliseconds; set to `0` to disable cache.
 - `ROUTE_CACHE_MAX` (default: 500): max number of cached routes.
-- `PAGE_POOL_SIZE` (default: 5): number of browser pages to keep in the pool.
 
 ## Caching Behavior
 

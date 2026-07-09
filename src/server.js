@@ -1,80 +1,63 @@
 const cors = require("cors");
 const express = require("express");
-const puppeteer = require("puppeteer");
+const axios = require("axios");
+const http = require("http");
+const https = require("https");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 
-let browserPromise = null;
 const pendingRoutes = new Map();
 const routeCache = new Map();
-const pagePool = [];
-const pageWaitQueue = [];
-let pagePoolPromise = null;
 
 const ROUTE_TIMEOUT_MS = readPositiveNumberEnv("ROUTE_TIMEOUT_MS", 4000);
-const NAVIGATION_TIMEOUT_MS = ROUTE_TIMEOUT_MS + 1000;
 const ROUTE_CACHE_TTL_MS = readNonNegativeNumberEnv("ROUTE_CACHE_TTL_MS", 5 * 60 * 1000);
 const ROUTE_CACHE_MAX = readPositiveNumberEnv("ROUTE_CACHE_MAX", 500);
 const ROUTE_CACHE_COORD_STEP = 0.00005;
-const PAGE_POOL_SIZE = readPositiveNumberEnv("PAGE_POOL_SIZE", 5);
+const GOOGLE_MAPS_BASE_URL = "https://www.google.com";
+const GOOGLE_MAPS_HEADERS = {
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Connection": "keep-alive",
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+};
+const googleMapsClient = axios.create({
+  timeout: ROUTE_TIMEOUT_MS,
+  headers: GOOGLE_MAPS_HEADERS,
+  httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+  httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
+  maxRedirects: 3,
+  responseType: "text"
+});
 const DEFAULT_TRAVEL_MODE = "driving";
 const TRAVEL_MODES = new Set(["driving", "walking", "bicycling", "transit"]);
-// Keep scripts and XHR unblocked; Maps needs them to request /maps/preview/directions.
-const BLOCKED_RESOURCE_PATTERNS = [
-  "*.avif*",
-  "*.apng*",
-  "*.bmp*",
-  "*.png*",
-  "*.jpg*",
-  "*.jpeg*",
-  "*.gif*",
-  "*.webp*",
-  "*.svg*",
-  "*.ico*",
-  "*.tif*",
-  "*.tiff*",
-  "*.heic*",
-  "*.heif*",
-  "*.css*",
-  "*.woff*",
-  "*.woff2*",
-  "*.ttf*",
-  "*.otf*",
-  "*.eot*",
-  "*.mp4*",
-  "*.m4v*",
-  "*.mov*",
-  "*.avi*",
-  "*.webm*",
-  "*.ogv*",
-  "*.mp3*",
-  "*.wav*",
-  "*.m4a*",
-  "*.aac*",
-  "*.flac*",
-  "*.opus*",
-  "*://*.doubleclick.net/*",
-  "*://*.google-analytics.com/*",
-  "*://*.googletagmanager.com/*",
-  "*://adservice.google.com/*",
-  "*://googleads.g.doubleclick.net/*",
-  "https://fonts.googleapis.com/*",
-  "https://fonts.gstatic.com/*",
-  "https://lh*.googleusercontent.com/*",
-  "https://geo*.ggpht.com/*",
-  "https://khms*.google.com/*",
-  "https://mt*.google.com/*",
-  "https://play.google.com/log*",
-  "https://streetviewpixels-pa.googleapis.com/*",
-  "https://www.google.com/client_204*",
-  "https://www.google.com/gen_204*",
-  "https://www.google.com/log*",
-  "https://www.gstatic.com/images/*",
-  "https://maps.gstatic.com/*/icons/*",
-  "https://maps.gstatic.com/mapfiles/*",
-  "https://maps.gstatic.com/tactile/*"
-];
+const DIRECTIONS_MODE_OPTIONS = {
+  driving: {
+    travelModeCode: 0,
+    outerFlagCount: 54,
+    innerFlagCount: 24,
+    modeFlags: "!246b1!253b1!260b1!266b1!270b1!273b1!279b1"
+  },
+  walking: {
+    travelModeCode: 2,
+    outerFlagCount: 55,
+    innerFlagCount: 25,
+    modeFlags: "!246b1!253b1!260b1!266b1!270b1!271b1!273b1!279b1"
+  },
+  bicycling: {
+    travelModeCode: 1,
+    outerFlagCount: 55,
+    innerFlagCount: 25,
+    modeFlags: "!239b1!246b1!253b1!260b1!266b1!270b1!273b1!279b1"
+  },
+  transit: {
+    travelModeCode: 3,
+    outerFlagCount: 55,
+    innerFlagCount: 25,
+    modeFlags: "!246b1!253b1!260b1!266b1!270b1!273b1!279b1!281b1"
+  }
+};
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
@@ -102,17 +85,21 @@ app.use((req, res, next) => {
 
 // ✅ 1. Distance API
 app.get("/distance", async (req, res) => {
+  const startedAt = Date.now();
+
   try {
     const { source, destination, travelMode } = parseInput(req);
     const googleMapUrl = buildGoogleMapsUrl(source, destination, travelMode);
 
     logInfo("distance:fetch", { source, destination, travelMode });
 
-    const data = await fetchRoute(source, destination, travelMode);
+    const data = await fetchRoute(source, destination, travelMode, {
+      includePolyline: false
+    });
 
     const selectedRoute = selectShortestRoute(data.routes);
 
-    const distanceKm = parseDistanceToKm(selectedRoute.distance);
+    const distanceKm = selectedRoute.distanceKm ?? parseDistanceToKm(selectedRoute.distance);
 
     logInfo("distance:success", {
       source,
@@ -130,23 +117,31 @@ app.get("/distance", async (req, res) => {
       travelMode,
       googleMapUrl,
       distance: distanceKm,
-      duration: selectedRoute.duration || null
+      duration: selectedRoute.duration || null,
+      processingTimeMs: Date.now() - startedAt
     });
   } catch (e) {
     logError("distance:error", e, { body: req.body });
-    res.status(500).json({ error: e.message });
+    res.status(500).json({
+      error: e.message,
+      processingTimeMs: Date.now() - startedAt
+    });
   }
 });
 
 // ✅ 2. Polyline API
 app.get("/polyline", async (req, res) => {
+  const startedAt = Date.now();
+
   try {
     const { source, destination, travelMode } = parseInput(req);
     const googleMapUrl = buildGoogleMapsUrl(source, destination, travelMode);
 
     logInfo("polyline:fetch", { source, destination, travelMode });
 
-    const data = await fetchRoute(source, destination, travelMode);
+    const data = await fetchRoute(source, destination, travelMode, {
+      includePolyline: true
+    });
 
     const selectedRoute = selectShortestRoute(data.routes);
 
@@ -164,11 +159,15 @@ app.get("/polyline", async (req, res) => {
       destination,
       travelMode,
       googleMapUrl,
-      polyline: selectedRoute.polyline || null
+      polyline: selectedRoute.polyline || null,
+      processingTimeMs: Date.now() - startedAt
     });
   } catch (e) {
     logError("polyline:error", e, { body: req.body });
-    res.status(500).json({ error: e.message });
+    res.status(500).json({
+      error: e.message,
+      processingTimeMs: Date.now() - startedAt
+    });
   }
 });
 
@@ -176,18 +175,13 @@ app.get("/polyline", async (req, res) => {
 
 app.listen(port, () => {
   logInfo("server:started", { port });
-
-  if (process.env.PREWARM_BROWSER !== "false") {
-    getBrowser()
-      .then(initPagePool)
-      .catch(() => {});
-  }
 });
 
 /* ================= CORE ================= */
 
-async function fetchRoute(source, destination, travelMode) {
-  const cacheKey = buildRouteCacheKey(source, destination, travelMode);
+async function fetchRoute(source, destination, travelMode, options = {}) {
+  const includePolyline = options.includePolyline === true;
+  const cacheKey = buildRouteCacheKey(source, destination, travelMode, includePolyline);
   const cached = getCachedRoute(cacheKey);
 
   if (cached) {
@@ -202,7 +196,9 @@ async function fetchRoute(source, destination, travelMode) {
     return pending;
   }
 
-  const routePromise = fetchRouteUncached(source, destination, travelMode)
+  const routePromise = fetchRouteUncached(source, destination, travelMode, {
+    includePolyline
+  })
     .then((data) => {
       if (data.routes.length > 0) {
         setCachedRoute(cacheKey, data);
@@ -218,321 +214,182 @@ async function fetchRoute(source, destination, travelMode) {
   return routePromise;
 }
 
-async function fetchRouteUncached(source, destination, travelMode) {
-  const url = buildGoogleMapsUrl(source, destination, travelMode);
+async function fetchRouteUncached(source, destination, travelMode, options = {}) {
+  const googleMapUrl = buildGoogleMapsUrl(source, destination, travelMode);
+  const includePolyline = options.includePolyline === true;
 
   logInfo("route:start", { source, destination, travelMode });
 
-  const browser = await getBrowser();
-  const pooledPage = await acquirePage(browser);
-  const page = pooledPage.page;
-  let finished = false;
-
   try {
-    const directionsResponse = page
-      .waitForResponse(
-        (response) => response.url().includes("/maps/preview/directions"),
-        { timeout: ROUTE_TIMEOUT_MS }
-      )
-      .then(async (response) => {
-        const text = await response.text();
-        const routes = extractRoutes(text, source, destination);
-
-        logInfo("route:resolved", {
-          source,
-          destination,
-          travelMode,
-          routeCount: routes.length
-        });
-
-        return { routes };
-      })
-      .catch((e) => {
-        if (finished) {
-          return emptyResponse(source, destination);
-        }
-
-        if (e.name === "TimeoutError") {
-          logInfo("route:timeout", { source, destination, travelMode });
-        } else {
-          logError("route:parse-error", e, { source, destination, travelMode });
-        }
-
-        return emptyResponse(source, destination);
-      });
-
-    const pageLoadFailure = page
-      .goto(url, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS })
-      .then(() => new Promise(() => {}))
-      .catch((e) => {
-        if (!finished) {
-          logError("route:page-load-error", e, { source, destination, travelMode });
-        }
-
-        return emptyResponse(source, destination);
-      });
-
-    const result = await Promise.race([directionsResponse, pageLoadFailure]);
-    finished = true;
-    return result;
-  } finally {
-    await releasePage(pooledPage, { source, destination, travelMode });
-  }
-}
-
-/* ================= BROWSER ================= */
-
-async function getBrowser() {
-  if (!browserPromise) {
-    logInfo("browser:launch");
-    browserPromise = puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--disable-extensions",
-        "--disable-sync",
-        "--disable-translate",
-        "--hide-scrollbars",
-        "--mute-audio",
-        "--no-first-run",
-        "--blink-settings=imagesEnabled=false"
-      ]
-    })
-      .then((browser) => {
-        logInfo("browser:ready");
-        browser.on("disconnected", () => {
-          browserPromise = null;
-          resetPagePool();
-          logInfo("browser:disconnected");
-        });
-        return browser;
-      })
-      .catch((e) => {
-        browserPromise = null;
-        logError("browser:error", e);
-        throw e;
-      });
-  }
-  return browserPromise;
-}
-
-async function initPagePool(browser) {
-  if (pagePool.length >= PAGE_POOL_SIZE) return;
-  if (pagePoolPromise) return pagePoolPromise;
-
-  pagePoolPromise = (async () => {
-    if (pagePool.length >= PAGE_POOL_SIZE) return;
-
-    logInfo("page-pool:init", { size: PAGE_POOL_SIZE });
-
-    while (pagePool.length < PAGE_POOL_SIZE) {
-      const page = await browser.newPage();
-      await prepareFastPage(page);
-
-      const pooledPage = {
-        id: pagePool.length + 1,
-        page,
-        busy: false
-      };
-
-      page.on("close", () => {
-        removePageFromPool(pooledPage);
-      });
-
-      pagePool.push(pooledPage);
-    }
-
-    logInfo("page-pool:ready", { size: pagePool.length });
-  })().catch((e) => {
-    logError("page-pool:error", e);
-    throw e;
-  }).finally(() => {
-    pagePoolPromise = null;
-  });
-
-  return pagePoolPromise;
-}
-
-async function acquirePage(browser) {
-  await initPagePool(browser);
-
-  const availablePage = pagePool.find((pooledPage) => {
-    return !pooledPage.busy && !pooledPage.page.isClosed();
-  });
-
-  if (availablePage) {
-    availablePage.busy = true;
-    logInfo("page-pool:acquire", { id: availablePage.id });
-    return availablePage;
-  }
-
-  logInfo("page-pool:queue", {
-    busy: pagePool.filter((pooledPage) => pooledPage.busy).length,
-    queue: pageWaitQueue.length + 1
-  });
-
-  return new Promise((resolve, reject) => {
-    pageWaitQueue.push({ resolve, reject });
-  });
-}
-
-async function releasePage(pooledPage, details = {}) {
-  if (!pooledPage) return;
-
-  if (pooledPage.page.isClosed()) {
-    await replacePooledPage(pooledPage);
-    return;
-  }
-
-  if (!pooledPage.page.isClosed()) {
-    try {
-      await pooledPage.page.goto("about:blank", {
-        waitUntil: "domcontentloaded",
-        timeout: 1000
-      });
-    } catch (e) {
-      logError("page-pool:reset-error", e, {
-        id: pooledPage.id,
-        ...details
-      });
-      await replacePooledPage(pooledPage);
-      return;
-    }
-  }
-
-  pooledPage.busy = false;
-  assignPageToWaitingRequest(pooledPage);
-}
-
-function assignPageToWaitingRequest(pooledPage) {
-  const waiter = pageWaitQueue.shift();
-
-  if (!waiter) {
-    logInfo("page-pool:release", { id: pooledPage.id });
-    return;
-  }
-
-  if (pooledPage.page.isClosed()) {
-    waiter.reject(new Error("Pooled page closed"));
-    return;
-  }
-
-  pooledPage.busy = true;
-  logInfo("page-pool:handoff", {
-    id: pooledPage.id,
-    queue: pageWaitQueue.length
-  });
-  waiter.resolve(pooledPage);
-}
-
-async function replacePooledPage(pooledPage) {
-  removePageFromPool(pooledPage);
-
-  try {
-    const browser = await getBrowser();
-    const page = await browser.newPage();
-    await prepareFastPage(page);
-
-    const replacement = {
-      id: pooledPage.id,
-      page,
-      busy: false
-    };
-
-    page.on("close", () => {
-      removePageFromPool(replacement);
+    const directRoutes = await tryFetchGeneratedRoutes(source, destination, travelMode, googleMapUrl, {
+      includePolyline
     });
 
-    pagePool.push(replacement);
-    assignPageToWaitingRequest(replacement);
+    if (directRoutes) return { routes: directRoutes };
+
+    const fallbackResponse = await fetchPreloadDirections(googleMapUrl, source, destination, travelMode);
+    const fallbackRoutes = extractRoutes(fallbackResponse.data, source, destination, {
+      includePolyline
+    });
+
+    logInfo("route:resolved", {
+      source,
+      destination,
+      travelMode,
+      includePolyline,
+      strategy: "preload-fallback",
+      routeCount: fallbackRoutes.length
+    });
+
+    return { routes: fallbackRoutes };
   } catch (e) {
-    logError("page-pool:replace-error", e, { id: pooledPage.id });
-    rejectNextPageWaiter(e);
+    if (e.code === "ECONNABORTED") {
+      logInfo("route:timeout", { source, destination, travelMode });
+    } else {
+      logError("route:http-error", e, {
+        source,
+        destination,
+        travelMode,
+        statusCode: e.response?.status
+      });
+    }
+
+    return emptyResponse();
   }
 }
 
-function removePageFromPool(pooledPage) {
-  const index = pagePool.indexOf(pooledPage);
+async function tryFetchGeneratedRoutes(source, destination, travelMode, googleMapUrl, options) {
+  try {
+    const directResponse = await fetchGeneratedDirections(source, destination, travelMode, googleMapUrl);
+    const routes = extractRoutes(directResponse.data, source, destination, options);
 
-  if (index !== -1) {
-    pagePool.splice(index, 1);
+    if (routes.length === 0) {
+      logInfo("route:generated-empty", { source, destination, travelMode });
+      return null;
+    }
+
+    logInfo("route:resolved", {
+      source,
+      destination,
+      travelMode,
+      includePolyline: options.includePolyline === true,
+      strategy: "generated-directions",
+      routeCount: routes.length
+    });
+
+    return routes;
+  } catch (e) {
+    if (e.code === "ECONNABORTED") throw e;
+
+    logError("route:generated-error", e, {
+      source,
+      destination,
+      travelMode,
+      statusCode: e.response?.status
+    });
+
+    return null;
   }
 }
 
-function rejectNextPageWaiter(error) {
-  const waiter = pageWaitQueue.shift();
-
-  if (waiter) {
-    waiter.reject(error);
-  }
-}
-
-function resetPagePool() {
-  pagePool.length = 0;
-  pagePoolPromise = null;
-
-  while (pageWaitQueue.length > 0) {
-    rejectNextPageWaiter(new Error("Browser disconnected"));
-  }
-}
-
-async function prepareFastPage(page) {
-  await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 1 });
-  await page.setCacheEnabled(true);
-
-  const client = await page.target().createCDPSession();
-  await client.send("Network.enable");
-  await client.send("Network.setBlockedURLs", {
-    urls: BLOCKED_RESOURCE_PATTERNS
+async function fetchGeneratedDirections(source, destination, travelMode, googleMapUrl) {
+  return googleMapsClient.get(buildGeneratedDirectionsUrl(source, destination, travelMode), {
+    headers: buildDirectionsHeaders(googleMapUrl)
   });
+}
 
-  return client;
+async function fetchPreloadDirections(googleMapUrl, source, destination, travelMode) {
+  const pageResponse = await googleMapsClient.get(googleMapUrl);
+  const directionsUrl = extractDirectionsUrl(pageResponse.data);
+
+  if (!directionsUrl) {
+    logInfo("route:directions-url-missing", { source, destination, travelMode });
+    return { data: "" };
+  }
+
+  return googleMapsClient.get(directionsUrl, {
+    headers: buildDirectionsHeaders(googleMapUrl)
+  });
+}
+
+function buildDirectionsHeaders(googleMapUrl) {
+  return {
+    ...GOOGLE_MAPS_HEADERS,
+    "Accept": "*/*",
+    "Referer": googleMapUrl
+  };
+}
+
+function buildGeneratedDirectionsUrl(source, destination, travelMode) {
+  const options = DIRECTIONS_MODE_OPTIONS[travelMode] || DIRECTIONS_MODE_OPTIONS[DEFAULT_TRAVEL_MODE];
+  const pb = [
+    `!1m4!3m2!3d${source.lat}!4d${source.lng}!6e2`,
+    `!1m4!3m2!3d${destination.lat}!4d${destination.lng}!6e2`,
+    "!3m12!1m3!1d60285.46432695884!2d73.0700306!3d19.202118249999998",
+    "!2m3!1f0.0!2f0.0!3f0.0!3m2!1i1024!2i768!4f13.1",
+    `!6m${options.outerFlagCount}!1m5!18b1!30b1!31m1!1b1!34e1`,
+    `!2m4!5m1!6e2!20e3!39b1!6m${options.innerFlagCount}`,
+    "!32i1!49b1!63m0!66b1!85b1!114b1!149b1!206b1!209b1!212b1!216b1",
+    "!222b1!223b1!232b1!234b1!235b1",
+    options.modeFlags,
+    "!291m0!10b1!12b1!13b1!14b1!16b1!17m1!3e1",
+    `!20m6!1e${options.travelModeCode}!2e3!5e2!6b1!8b1!14b1`,
+    "!46m1!1b0!96b1!99b1!15m3!1sdirect!7e81!15i10142"
+  ].join("");
+
+  const url = new URL("/maps/preview/directions", GOOGLE_MAPS_BASE_URL);
+  url.searchParams.set("authuser", "0");
+  url.searchParams.set("hl", "en");
+  url.searchParams.set("gl", "in");
+  url.searchParams.set("pb", pb);
+
+  return url.toString();
 }
 
 /* ================= PARSER ================= */
 
-function extractRoutes(text, origin, destination) {
+function extractDirectionsUrl(html) {
+  if (typeof html !== "string") return null;
+
+  const match = html.match(/href="([^"]*\/maps\/preview\/directions[^"]*)"/);
+  if (!match) return null;
+
+  const href = decodeHtmlEntities(match[1]);
+  return new URL(href, GOOGLE_MAPS_BASE_URL).toString();
+}
+
+function decodeHtmlEntities(value) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function extractRoutes(text, origin, destination, options = {}) {
   try {
     const data = JSON.parse(text.replace(/^\)\]\}'\n/, ""));
     const routes = data?.[0]?.[1] || [];
 
-    return routes.map((r, i) => buildRoute(r, i, origin, destination));
+    return routes.map((r, i) => buildRoute(r, i, origin, destination, options));
   } catch {
     return [];
   }
 }
 
-function buildRoute(route, index, origin, destination) {
+function buildRoute(route, index, origin, destination, options = {}) {
   const summary = route?.[0];
-  const points = extractPoints(route, origin, destination);
+  const includePolyline = options.includePolyline === true;
 
   return {
     index,
     distance: summary?.[2]?.[1] || null,
+    distanceKm: parseDistanceSummaryToKm(summary?.[2]),
     duration: summary?.[3]?.[1] || null,
-    polyline: buildPolyline(points)
+    polyline: includePolyline ? buildPolyline(extractPoints(route, origin, destination)) : null
   };
 }
-
-function selectShortestRoute(routes) {
-  if (!Array.isArray(routes) || routes.length === 0) return {};
-
-  return routes.reduce((shortest, route) => {
-    const shortestDistance = parseDistanceToKm(shortest.distance);
-    const routeDistance = parseDistanceToKm(route.distance);
-
-    if (shortestDistance == null) return routeDistance == null ? shortest : route;
-    if (routeDistance == null) return shortest;
-
-    return routeDistance < shortestDistance ? route : shortest;
-  }, routes[0]);
-}
-
-/* ================= POLYLINE ================= */
 
 function extractPoints(route, origin, destination) {
   const points = [];
@@ -567,6 +424,27 @@ function addPoint(arr, p) {
       lng: Number(p.lng.toFixed(6))
     });
   }
+}
+
+function selectShortestRoute(routes) {
+  if (!Array.isArray(routes) || routes.length === 0) return {};
+
+  return routes.reduce((shortest, route) => {
+    const shortestDistance = shortest.distanceKm ?? parseDistanceToKm(shortest.distance);
+    const routeDistance = route.distanceKm ?? parseDistanceToKm(route.distance);
+
+    if (shortestDistance == null) return routeDistance == null ? shortest : route;
+    if (routeDistance == null) return shortest;
+
+    return routeDistance < shortestDistance ? route : shortest;
+  }, routes[0]);
+}
+
+function parseDistanceSummaryToKm(summaryDistance) {
+  const meters = summaryDistance?.[0];
+  if (Number.isFinite(meters)) return meters / 1000;
+
+  return parseDistanceToKm(summaryDistance?.[1]);
 }
 
 function cleanPoints(points) {
@@ -704,23 +582,39 @@ function parseDistanceToKm(distanceText) {
   if (typeof distanceText !== "string") return null;
 
   const normalized = distanceText.replace(/,/g, "").trim();
-  const match = normalized.match(/([\d.]+)\s*(mi|km|m|ft|yd)\b/i);
+  const match = normalized.match(/([\d.]+)\s*(miles?|mi|kilometers?|kilometres?|km|meters?|metres?|m|feet|foot|ft|yards?|yd)\b/i);
 
   if (!match) return null;
 
   const value = Number(match[1]);
   if (!Number.isFinite(value)) return null;
 
-  switch (match[2].toLowerCase()) {
+  const unit = match[2].toLowerCase();
+
+  switch (unit) {
     case "km":
+    case "kilometer":
+    case "kilometers":
+    case "kilometre":
+    case "kilometres":
       return value;
     case "m":
+    case "meter":
+    case "meters":
+    case "metre":
+    case "metres":
       return value / 1000;
     case "mi":
+    case "mile":
+    case "miles":
       return value * 1.609344;
     case "ft":
+    case "foot":
+    case "feet":
       return value * 0.0003048;
     case "yd":
+    case "yard":
+    case "yards":
       return value * 0.0009144;
     default:
       return null;
@@ -737,8 +631,9 @@ function readNonNegativeNumberEnv(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function buildRouteCacheKey(source, destination, travelMode) {
-  return `${travelMode}:${formatCacheCoordinate(source.lat)},${formatCacheCoordinate(source.lng)}->${formatCacheCoordinate(destination.lat)},${formatCacheCoordinate(destination.lng)}`;
+function buildRouteCacheKey(source, destination, travelMode, includePolyline = false) {
+  const detail = includePolyline ? "polyline" : "summary";
+  return `${detail}:${travelMode}:${formatCacheCoordinate(source.lat)},${formatCacheCoordinate(source.lng)}->${formatCacheCoordinate(destination.lat)},${formatCacheCoordinate(destination.lng)}`;
 }
 
 function formatCacheCoordinate(value) {
@@ -809,7 +704,7 @@ function buildGoogleMapsUrl(s, d, travelMode = DEFAULT_TRAVEL_MODE) {
   return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}&travelmode=${mode}`;
 }
 
-function emptyResponse(source, destination) {
+function emptyResponse() {
   return {
     routes: []
   };
