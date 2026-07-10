@@ -173,9 +173,11 @@ app.get("/polyline", async (req, res) => {
 
 /* ================= SERVER ================= */
 
-app.listen(port, () => {
-  logInfo("server:started", { port });
-});
+if (require.main === module) {
+  app.listen(port, () => {
+    logInfo("server:started", { port });
+  });
+}
 
 /* ================= CORE ================= */
 
@@ -386,6 +388,7 @@ function buildRoute(route, index, origin, destination, options = {}) {
     index,
     distance: summary?.[2]?.[1] || null,
     distanceKm: parseDistanceSummaryToKm(summary?.[2]),
+    rawDistanceKm: parseRawDistanceSummaryToKm(summary?.[2]),
     duration: summary?.[3]?.[1] || null,
     polyline: includePolyline ? buildPolyline(extractPoints(route, origin, destination)) : null
   };
@@ -430,8 +433,8 @@ function selectShortestRoute(routes) {
   if (!Array.isArray(routes) || routes.length === 0) return {};
 
   return routes.reduce((shortest, route) => {
-    const shortestDistance = shortest.distanceKm ?? parseDistanceToKm(shortest.distance);
-    const routeDistance = route.distanceKm ?? parseDistanceToKm(route.distance);
+    const shortestDistance = getComparableDistanceKm(shortest);
+    const routeDistance = getComparableDistanceKm(route);
 
     if (shortestDistance == null) return routeDistance == null ? shortest : route;
     if (routeDistance == null) return shortest;
@@ -441,10 +444,21 @@ function selectShortestRoute(routes) {
 }
 
 function parseDistanceSummaryToKm(summaryDistance) {
+  const displayDistance = parseDistanceToKm(summaryDistance?.[1]);
+  if (displayDistance != null) return displayDistance;
+
+  return parseRawDistanceSummaryToKm(summaryDistance);
+}
+
+function parseRawDistanceSummaryToKm(summaryDistance) {
   const meters = summaryDistance?.[0];
   if (Number.isFinite(meters)) return meters / 1000;
 
   return parseDistanceToKm(summaryDistance?.[1]);
+}
+
+function getComparableDistanceKm(route) {
+  return route?.rawDistanceKm ?? route?.distanceKm ?? parseDistanceToKm(route?.distance);
 }
 
 function cleanPoints(points) {
@@ -709,3 +723,10 @@ function emptyResponse() {
     routes: []
   };
 }
+
+module.exports = {
+  app,
+  parseDistanceSummaryToKm,
+  parseRawDistanceSummaryToKm,
+  selectShortestRoute
+};
